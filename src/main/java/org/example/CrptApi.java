@@ -63,7 +63,9 @@ public class CrptApi {
 
     public CrptApi(TimeUnit timeUnit, int requestLimit, int duration) {
         this.timeDuration = timeUnit.toMillis(duration);
-        this.requestLimit = requestLimit;
+        if (requestLimit > 0) {
+            this.requestLimit = requestLimit;
+        } else {throw new RuntimeException("Максимальное количество запросов должно быть более 0");}
     }
 
     @Getter
