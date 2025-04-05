@@ -1,7 +1,6 @@
 package org.example;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
@@ -9,129 +8,140 @@ import com.fasterxml.jackson.datatype.jsr310.deser.LocalDateDeserializer;
 import com.fasterxml.jackson.datatype.jsr310.ser.LocalDateSerializer;
 import lombok.Getter;
 import lombok.Setter;
-import okhttp3.*;
 
-import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.LocalDate;
-import java.util.Arrays;
+import java.util.Deque;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class CrptApi {
-    private long timeDuration;
-    private int requestLimit;
+    private final int requestPerSecond = 1;
+    private final long timeDuration;
+    private final int requestLimit;
+
     private final String apiUrl = "https://ismp.crpt.ru/api/v3/lk/documents/create";
-    private final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
-
-    private final OkHttpClient HTTP_CLIENT = new OkHttpClient();
+    private final HttpClient httpClient = HttpClient.newHttpClient();
     private final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-    private long lastRequestTime = System.currentTimeMillis();
-    private int currentRequests = 0;
 
-    public String createDocument(Document document, String signature) throws IOException, InterruptedException {
-        checkTime();
+    @Getter
+    private final Queue<DataToSend> queue = new ConcurrentLinkedQueue<>();
+    private final Deque<Long> timestampDeque = new LinkedList<>();
+    private final ScheduledExecutorService schedulerSender = Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService schedulerLogger = Executors.newSingleThreadScheduledExecutor();
+    private final AtomicInteger sentInCurrentSecond = new AtomicInteger(0);
 
-        RequestBody requestBody = RequestBody.create(
-                OBJECT_MAPPER.writeValueAsString(document), JSON);
-        Request request = new Request.Builder()
-                .url(apiUrl)
-                .post(requestBody)
-                .addHeader("Signature", signature)
-                .build();
-        try (Response response = HTTP_CLIENT.newCall(request).execute()) {
-            return response.body().string();
-        }
-    }
 
-    public synchronized void checkTime() throws InterruptedException {
-        long timeNow = System.currentTimeMillis();
-        long timeDifference = timeNow - lastRequestTime;
-        if (timeDifference >= timeDuration) {
-            lastRequestTime = timeNow;
-            currentRequests = 0;
-        }
-        if (currentRequests >= requestLimit) {
-            long waitTime = lastRequestTime + timeDuration - timeNow;
-            if (waitTime > 0) {
-                Thread.sleep(waitTime);
-            }
-            currentRequests = 0;
-            lastRequestTime = System.currentTimeMillis();
-        }
-        currentRequests++;
-    }
-
-    public CrptApi(TimeUnit timeUnit, int requestLimit, int duration) {
-        this.timeDuration = timeUnit.toMillis(duration);
+    public CrptApi(TimeUnit timeUnit, int requestLimit) {
+        this.timeDuration = timeUnit.toMillis(requestPerSecond);
         if (requestLimit > 0) {
             this.requestLimit = requestLimit;
-        } else {throw new RuntimeException("Максимальное количество запросов должно быть более 0");}
+        } else {
+            throw new RuntimeException("Максимальное количество запросов должно быть более 0");
+        }
+        startProcessing();
+        startStatsLogger();
+    }
+
+    private void startProcessing() {
+        schedulerSender.scheduleAtFixedRate(() -> {
+            long now = System.currentTimeMillis();
+            // Reset old timestamps
+            while (!timestampDeque.isEmpty() && now - timestampDeque.peekFirst() >= timeDuration) {
+                timestampDeque.pollFirst();
+            }
+            while (timestampDeque.size() < requestLimit && !queue.isEmpty()) {
+                timestampDeque.addLast(System.currentTimeMillis());
+                DataToSend data = queue.poll();
+                if (data == null) break;
+                sendToApi(data);
+            }
+        }, 0, 50, TimeUnit.MILLISECONDS); // check every 50ms
+    }
+
+    private void startStatsLogger() {
+        schedulerLogger.scheduleAtFixedRate(() -> {
+            int count = sentInCurrentSecond.getAndSet(0);
+            System.out.printf("[Stats] Sent %d requests in last second%n", count);
+        }, 1, 1, TimeUnit.SECONDS);
+    }
+
+    private void sendToApi(DataToSend dataToSend) {
+        sentInCurrentSecond.incrementAndGet(); //Logger counter per second
+        try {
+            String jsonBody = OBJECT_MAPPER.writeValueAsString(dataToSend.document);
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(apiUrl))
+                    .header("Content-Type", "application/json")
+                    .header("Signature", dataToSend.signature)
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                    .build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            System.out.printf("Doc id %s Response: %d%n", dataToSend.document.doc_id, response.statusCode());
+        } catch (Exception e) {
+            System.err.println("Error sending request: " + e.getMessage());
+        }
+    }
+
+    public void enqueueRequest(DataToSend data) {
+        queue.add(data);
+    }
+
+    public void shutdown() {
+        schedulerSender.shutdown();
+        schedulerLogger.shutdown();
+        System.out.println("Send stopped");
+    }
+
+
+    public record DataToSend(Document document, String signature) {
     }
 
     @Getter
     @Setter
     public static class Document {
-
-        private Description description;
         private String doc_id;
+        private Description description;
         private String doc_status;
         private String doc_type = "LP_INTRODUCE_GOODS";
         private Boolean importRequest;
         private String owner_inn;
         private String participant_inn;
         private String producer_inn;
-        @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-d")
-        @JsonDeserialize(using = LocalDateDeserializer.class)
-        @JsonSerialize(using = LocalDateSerializer.class)
-        private LocalDate production_date;
-        private String production_type;
-        private String[] products;
+        private String production_date;
+        private ProductionType production_type;
+        private List<Product> products;
         @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-d")
         @JsonDeserialize(using = LocalDateDeserializer.class)
         @JsonSerialize(using = LocalDateSerializer.class)
         private LocalDate reg_date;
         private String reg_number;
+    }
 
-        public Document(String id) {
-            this.doc_id = id;
-        }
-
-        @Override
-        public String toString() {
-            return "{" +
-                    "description='" + description + '\'' +
-                    ", doc_id='" + doc_id + '\'' +
-                    ", doc_status='" + doc_status + '\'' +
-                    ", doc_type='" + doc_type + '\'' +
-                    ", importRequest=" + importRequest +
-                    ", owner_inn='" + owner_inn + '\'' +
-                    ", participant_inn='" + participant_inn + '\'' +
-                    ", producer_inn='" + producer_inn + '\'' +
-                    ", production_date=" + production_date +
-                    ", production_type='" + production_type + '\'' +
-                    ", products=" + Arrays.toString(products) +
-                    ", reg_date=" + reg_date +
-                    ", reg_number='" + reg_number + '\'' +
-                    '}';
-        }
+    public enum ProductionType {
+        OWN_PRODUCTION,
+        CONTRACT_PRODUCTION
     }
 
     @Getter
     @Setter
     public static class Description {
         private String participantInn;
-
-        @Override
-        public String toString() {
-            return "{" +
-                    "participantInn='" + participantInn + '\'' +
-                    '}';
-        }
     }
 
     @Getter
     @Setter
-    public static class Products {
+    public static class Product {
+        private String productId;
         private String certificate_document;
         @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-d")
         @JsonDeserialize(using = LocalDateDeserializer.class)
@@ -149,40 +159,12 @@ public class CrptApi {
         private String uitu_code;
     }
 
-    public static void main(String[] args) throws IOException, InterruptedException {
-        CrptApi crptApi = new CrptApi(TimeUnit.MILLISECONDS, 2, 200);
-        Document document = fillDocument();
-
-        int numThreads = 100;
-        Thread[] threads = new Thread[numThreads];
-        for (int i = 0; i < numThreads; i++) {
-            threads[i] = new Thread(() -> {
-                try {
-                    crptApi.createDocument(document, "sampleSignature");
-                } catch (InterruptedException | IOException e) {
-                    e.printStackTrace();
-                }
-            });
-            threads[i].start();
-        }
-        // Ждем завершения всех потоков
-        for (Thread thread : threads) {
-            try {
-                thread.join();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
-    public static Document fillDocument() throws JsonProcessingException {
+    public static DataToSend fillDocument() {
         LocalDate localDate = LocalDate.of(2000, 1, 2);
-        LocalDate localDateNow = LocalDate.now();
 
-        ObjectMapper objectMapper = new ObjectMapper();
-        Products products = new Products();
+        Product products = new Product();
         products.setCertificate_document("String");
-        products.setCertificate_document_date(localDateNow);
+        products.setCertificate_document_date(LocalDate.now());
         products.setCertificate_document_number("String");
         products.setOwner_inn("String");
         products.setProducer_inn("String");
@@ -190,13 +172,11 @@ public class CrptApi {
         products.setTnved_code("String");
         products.setUit_code("String");
         products.setUitu_code("String");
-        String productToString = objectMapper.writeValueAsString(products);
-        String[] splitProduct = productToString.split(",");
 
         Description description = new Description();
         description.setParticipantInn("String");
 
-        Document document = new Document("String");
+        Document document = new Document();
         document.setDescription(description);
         document.setDoc_status("String");
         document.setDoc_type("LP_INTRODUCE_GOODS");
@@ -204,13 +184,42 @@ public class CrptApi {
         document.setOwner_inn("String");
         document.setParticipant_inn("String");
         document.setProducer_inn("String");
-        document.setProduction_date(localDateNow);
-        document.setProduction_type("String");
-        document.setProducts(splitProduct);
+        document.setProduction_date(localDate.toString());
+        document.setProduction_type(ProductionType.CONTRACT_PRODUCTION);
+        document.setProducts(List.of(products));
         document.setReg_date(localDate);
         document.setReg_number("String");
-        return document;
+        return new DataToSend(document, "Signature");
     }
 
+    public static void main(String[] args) {
+        CrptApi crptApi = new CrptApi(TimeUnit.SECONDS, 2);
 
+        // init queue request
+        new Thread(() -> {
+            int countRequest = 20;
+            for (int j = 0; j < countRequest; j++) {
+                DataToSend dataToSend;
+                dataToSend = fillDocument();
+                dataToSend.document.setDoc_id(String.valueOf(j));
+                crptApi.enqueueRequest(dataToSend);
+            }
+            System.out.println("\nTotal requests received: " + countRequest);
+        }).start();
+
+        // do request while queue is not empty
+        new Thread(() -> {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+            while (true) {
+                if (crptApi.getQueue().isEmpty()) {
+                    crptApi.shutdown();
+                    return;
+                }
+            }
+        }).start();
+    }
 }
